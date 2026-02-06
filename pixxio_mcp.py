@@ -535,6 +535,3 @@ async def get_metadata(params: GetAssetMetadataInput) -> str:
 # Server Entry Point
 # =============================================================================
 
-if __name__ == "__main__":
-    # Run MCP server with stdio transport
-    mcp.run()
