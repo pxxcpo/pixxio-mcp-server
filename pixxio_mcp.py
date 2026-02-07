@@ -479,3 +479,14 @@ async def download_file(params: DownloadFileInput) -> str:
 
 if __name__ == "__main__":
     mcp.run()
+
+# HTTP/SSE Transport für Cloud-Deployment
+if __name__ == "__main__":
+    import sys
+    # Check if running in HTTP mode
+    if "--http" in sys.argv or os.environ.get("RAILWAY_ENVIRONMENT"):
+        # Railway Cloud Mode
+        mcp.run(transport="sse")
+    else:
+        # Local Mode
+        mcp.run()
