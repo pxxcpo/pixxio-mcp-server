@@ -20,8 +20,6 @@ import json
 import logging
 from typing import Optional
 
-import base64
-
 import httpx
 from fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
@@ -99,26 +97,6 @@ async def _api_put(path: str, data: Optional[dict] = None) -> dict:
         return resp.json()
 
 
-async def _download_preview(preview_url: str, width: int = 400) -> Optional[Image]:
-    """Download a preview image and return it as a FastMCP Image."""
-    if not preview_url:
-        return None
-    try:
-        # Adjust width parameter in the preview URL
-        if "&width=" in preview_url:
-            preview_url = preview_url.rsplit("&width=", 1)[0] + f"&width={width}"
-        elif "?" in preview_url:
-            preview_url += f"&width={width}"
-
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers={"Authorization": f"Bearer {PIXXIO_API_KEY}"}) as client:
-            resp = await client.get(preview_url)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-            return Image(data=resp.content, media_type=content_type)
-    except Exception as e:
-        logger.warning(f"Failed to download preview: {e}")
-        return None
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TOOL 1: search  (Required for ChatGPT Deep Research)
@@ -135,8 +113,7 @@ async def search(
     file_extension: Optional[str] = None,
     directory_id: Optional[int] = None,
     collection_id: Optional[int] = None,
-    include_previews: bool = True,
-) -> list:
+) -> dict:
     """Search for assets in the pixx.io Digital Asset Management system.
 
     Use this tool to find images, videos, documents and other media files.
@@ -152,10 +129,10 @@ async def search(
         file_extension: Optional filter by extension: "jpg", "png", "pdf", "mp4", etc.
         directory_id: Optional filter by directory ID.
         collection_id: Optional filter by collection ID.
-        include_previews: If True, include thumbnail images in the response (default: True).
 
     Returns:
-        Asset search results with optional preview thumbnails.
+        Dictionary with 'ids' (list of asset ID strings) and 'results' (list of asset summaries).
+        Use the get_preview tool to view thumbnail images for specific assets.
     """
     params: dict = {
         "showFiles": "true",
@@ -242,20 +219,7 @@ async def search(
         "page_size": page_size,
     }
 
-    if not include_previews:
-        return return_data
-
-    # Return text data + preview images as inline content
-    response_items: list = [return_data]
-    for f in files:
-        preview_url = f.get("previewFileURL", "")
-        if preview_url:
-            img = await _download_preview(preview_url, width=300)
-            if img:
-                response_items.append(f"📷 {f.get('fileName', 'unknown')} (ID: {f.get('id')})")
-                response_items.append(img)
-
-    return response_items
+    return return_data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -263,23 +227,23 @@ async def search(
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool(annotations={"readOnlyHint": True})
-async def fetch(id: str) -> list:
+async def fetch(id: str) -> dict:
     """Fetch complete details for a specific asset by its ID.
 
-    Returns all metadata, keywords, preview URLs, file information,
-    and displays the preview image inline.
+    Returns all metadata, keywords, preview URLs, and file information.
+    Use the get_preview tool to view the asset image inline.
 
     Args:
         id: The asset ID to retrieve (as returned by the search tool).
 
     Returns:
-        Complete asset record with preview image.
+        Complete asset record with all available metadata.
     """
     data = await _api_get(f"/api/v1/files/{id}")
 
     f = data.get("file", data)
 
-    result = {
+    return {
         "id": str(f.get("id", id)),
         "title": f.get("fileName", ""),
         "file_name": f.get("fileName", ""),
@@ -307,16 +271,6 @@ async def fetch(id: str) -> list:
         "is_download_locked": f.get("isDownloadLocked", False),
         "metadata_fields": f.get("metadataFields"),
     }
-
-    # Include preview image inline
-    response_items: list = [result]
-    preview_url = f.get("previewFileURL", "")
-    if preview_url:
-        img = await _download_preview(preview_url, width=800)
-        if img:
-            response_items.append(img)
-
-    return response_items
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -381,11 +335,11 @@ async def get_download_url(
 async def get_preview(
     id: str,
     width: int = 800,
-) -> list:
+) -> Image:
     """Get the preview image of an asset displayed inline.
 
-    Use this to view an asset's image directly. For downloading the
-    original file, use get_download_url instead.
+    Use this to view an asset's image directly in the chat.
+    For downloading the original file, use get_download_url instead.
 
     Args:
         id: The asset ID.
@@ -399,16 +353,19 @@ async def get_preview(
     preview_url = f.get("previewFileURL", "")
 
     if not preview_url:
-        return [f"No preview available for asset {id}."]
+        raise ValueError(f"No preview available for asset {id}.")
 
-    img = await _download_preview(preview_url, width=width)
-    if not img:
-        return [f"Failed to load preview for asset {id}."]
+    # Adjust width parameter in the preview URL
+    if "&width=" in preview_url:
+        preview_url = preview_url.rsplit("&width=", 1)[0] + f"&width={width}"
+    elif "?" in preview_url:
+        preview_url += f"&width={width}"
 
-    return [
-        f"Preview of {f.get('fileName', 'unknown')} ({f.get('width', '?')}x{f.get('height', '?')} px)",
-        img,
-    ]
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers={"Authorization": f"Bearer {PIXXIO_API_KEY}"}) as client:
+        resp = await client.get(preview_url)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+        return Image(data=resp.content, media_type=content_type)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
