@@ -1,523 +1,734 @@
 #!/usr/bin/env python3
 """
-pixx.io MCP Server - Production Ready
-Fully integrated with pixx.io REST API v1
+pixx.io MCP Server — Production-Ready for Cloud Deployment
+Supports: Claude Desktop (stdio), ChatGPT (Streamable HTTP), Microsoft Copilot
+
+Transport modes:
+  - stdio:  For local Claude Desktop usage
+  - http:   For remote cloud deployment (ChatGPT, Claude Web, Copilot)
+
+Environment variables:
+  PIXXIO_API_KEY   — API key for pixx.io authentication
+  PIXXIO_BASE_URL  — Base URL of the pixx.io instance (e.g. https://yourspace.px.media)
+  TRANSPORT        — "stdio" or "http" (default: "http")
+  PORT             — HTTP port (default: 8000)
+  HOST             — HTTP host (default: "0.0.0.0")
 """
 
-import json
 import os
-from typing import Optional, List, Dict, Any
-from enum import Enum
+import json
+import logging
+from typing import Optional
+
+import base64
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image
 
-# Initialize MCP server
-mcp = FastMCP("pixxio_mcp")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("pixxio-mcp")
 
+# ---------------------------------------------------------------------------
 # Configuration
-DEFAULT_API_KEY = os.environ.get("PIXXIO_API_KEY", "")
-DEFAULT_API_BASE = os.environ.get("PIXXIO_BASE_URL", "https://richard.px.media/api")
-REQUEST_TIMEOUT = 30.0
+# ---------------------------------------------------------------------------
+PIXXIO_API_KEY = os.environ.get("PIXXIO_API_KEY", "")
+PIXXIO_BASE_URL = os.environ.get("PIXXIO_BASE_URL", "").rstrip("/")
+TRANSPORT = os.environ.get("TRANSPORT", "http").lower()
+PORT = int(os.environ.get("PORT", "8000"))
+HOST = os.environ.get("HOST", "0.0.0.0")
 
-# ============================================================================
-# ENUMS
-# ============================================================================
-
-class ResponseFormat(str, Enum):
-    """Output format for responses"""
-    MARKDOWN = "markdown"
-    JSON = "json"
-
-class SortBy(str, Enum):
-    """Sort options for file search"""
-    UPLOAD_DATE = "uploadDate"
-    MODIFY_DATE = "modifyDate"
-    CREATE_DATE = "createDate"
-    FILE_NAME = "fileName"
-    FILE_SIZE = "fileSize"
-
-class SortDirection(str, Enum):
-    """Sort direction"""
-    ASC = "asc"
-    DESC = "desc"
-
-class DownloadType(str, Enum):
-    """Download type for file conversion"""
-    PREVIEW = "preview"  # Preview version (default for showing)
-    ORIGINAL = "original"  # Original file without conversion
-    CUSTOM = "custom"  # Custom conversion with specified settings
-    DOWNLOAD_FORMAT = "downloadFormat"  # Use predefined download format
-
-class ResponseType(str, Enum):
-    """Response type for downloads"""
-    BINARY = "binary"  # Download as binary data
-    PATH = "path"  # Get temporary URL (24h validity)
-    BASE64 = "base64"  # Get base64 encoded data
-    DIRECTLINK = "directlink"  # Create permanent link
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def _format_filesize(size_bytes: int) -> str:
-    """Convert bytes to human-readable format"""
-    if not size_bytes:
-        return "0 B"
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} PB"
-
-def _get_api_key(provided_key: Optional[str]) -> str:
-    """Get API key from provided parameter or environment variable"""
-    api_key = provided_key or DEFAULT_API_KEY
-    if not api_key:
-        raise ValueError(
-            "No API key provided. Either pass api_key parameter or set PIXXIO_API_KEY environment variable."
-        )
-    return api_key
-
-def _format_asset_markdown(file: Dict[str, Any]) -> str:
-    """Format a single file/asset as markdown"""
-    lines = [
-        f"## {file.get('fileName', 'Untitled')}",
-        f"**ID**: {file.get('id', 'N/A')}",
-    ]
-    
-    if file_type := file.get('fileType'):
-        lines.append(f"**Type**: {file_type}")
-    
-    if file_size := file.get('fileSize'):
-        lines.append(f"**Size**: {_format_filesize(file_size)}")
-    
-    if upload_date := file.get('uploadDate'):
-        lines.append(f"**Uploaded**: {upload_date}")
-    
-    if description := file.get('description'):
-        lines.append(f"**Description**: {description}")
-    
-    if keywords := file.get('keywords'):
-        if isinstance(keywords, list):
-            lines.append(f"**Keywords**: {', '.join(keywords)}")
-    
-    # Add image URLs if available
-    if preview_url := file.get('previewFileURL'):
-        lines.append(f"\n**Preview**: {preview_url}")
-    
-    if original_url := file.get('originalFileURL'):
-        lines.append(f"**Original**: {original_url}")
-    
-    return "\n".join(lines)
-
-# ============================================================================
-# API CLIENT
-# ============================================================================
-
-class PixxioAPIClient:
-    """Client for pixx.io API interactions"""
-    
-    def __init__(self, api_key: str, base_url: str = DEFAULT_API_BASE):
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
-        # Base headers - only Authorization
-        self.base_headers = {
-            "Authorization": f"Bearer {api_key}"
-        }
-    
-    async def request(
-        self,
-        method: str,
-        endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Make an HTTP request to the pixx.io API"""
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            url = f"{self.base_url}/{endpoint.lstrip('/')}"
-            
-            # Set headers based on method - GET requests should not have Content-Type
-            headers = self.base_headers.copy()
-            if method.upper() in ["POST", "PUT", "PATCH"] and data:
-                headers["Content-Type"] = "application/json"
-            
-            try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=data
-                )
-                response.raise_for_status()
-                return response.json()
-                
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                try:
-                    error_data = e.response.json()
-                    error_msg = error_data.get('errorMessage', f'HTTP {status}')
-                    error_code = error_data.get('errorCode', 'N/A')
-                    # Include full error for debugging
-                    raise Exception(f"API error (code {error_code}): {error_msg} | Full response: {error_data}")
-                except json.JSONDecodeError:
-                    raise Exception(f"HTTP {status}: {e.response.text[:200]}")
-                
-                if status == 401:
-                    raise Exception(f"Authentication failed: {error_msg}")
-                elif status == 404:
-                    raise Exception(f"Resource not found: {error_msg}")
-                elif status == 429:
-                    raise Exception(f"Rate limit exceeded: {error_msg}")
-                else:
-                    raise Exception(f"API error: {error_msg}")
-                    
-            except httpx.TimeoutException:
-                raise Exception("Request timed out. Please try again.")
-                
-            except Exception as e:
-                raise Exception(f"Request failed: {str(e)}")
-
-# ============================================================================
-# INPUT MODELS
-# ============================================================================
-
-class SearchFilesInput(BaseModel):
-    """Input parameters for file search"""
-    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    api_key: Optional[str] = Field(default=None, min_length=10, description="pixx.io API key (optional if set in environment)")
-    query: str = Field(..., min_length=1, max_length=500, description="Search query - searches in filename, description, and keywords")
-    file_types: Optional[List[str]] = Field(default=None, description="Filter by file extensions (e.g., ['jpg', 'png', 'pdf'])")
-    page: int = Field(default=1, ge=1, description="Page number")
-    page_size: int = Field(default=20, ge=1, le=500, description="Results per page")
-    sort_by: SortBy = Field(default=SortBy.UPLOAD_DATE, description="Sort field")
-    sort_direction: SortDirection = Field(default=SortDirection.DESC, description="Sort direction")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
-
-class GetFileDetailsInput(BaseModel):
-    """Input parameters for getting file details"""
-    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    api_key: Optional[str] = Field(default=None, min_length=10, description="pixx.io API key (optional if set in environment)")
-    file_id: int = Field(..., ge=1, description="File ID")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
-
-class DownloadFileInput(BaseModel):
-    """Input parameters for downloading a file"""
-    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    api_key: Optional[str] = Field(default=None, min_length=10, description="pixx.io API key (optional if set in environment)")
-    file_id: int = Field(..., ge=1, description="File ID to download")
-    download_type: DownloadType = Field(default=DownloadType.PREVIEW, description="Type of download (preview, original, custom, downloadFormat)")
-    save_path: Optional[str] = Field(default=None, description="Optional custom filename (without extension). If not provided, uses original filename.")
-    show_in_chat: bool = Field(default=True, description="If true, displays the image in chat after download")
-    
-    # Custom conversion parameters (only for download_type=CUSTOM)
-    width: Optional[int] = Field(default=None, ge=1, description="Target width in pixels (for custom downloads)")
-    height: Optional[int] = Field(default=None, ge=1, description="Target height in pixels (for custom downloads)")
-    quality: Optional[int] = Field(default=90, ge=1, le=100, description="JPEG quality 1-100 (for custom downloads)")
-    file_extension: Optional[str] = Field(default="jpg", description="Output format: jpg, png, pdf, tiff, webp (for custom downloads)")
-    
-    # Download format ID (only for download_type=DOWNLOAD_FORMAT)
-    download_format_id: Optional[int] = Field(default=None, ge=1, description="Download format ID (required if download_type=downloadFormat)")
-
-# ============================================================================
-# MCP TOOLS
-# ============================================================================
-
-@mcp.tool(
-    name="pixxio_search_files",
-    annotations={
-        "title": "Search Files in pixx.io",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-    }
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+mcp = FastMCP(
+    "pixx.io DAM",
+    instructions=(
+        "pixx.io is a Digital Asset Management (DAM) system. "
+        "Use these tools to search, browse, and manage digital assets "
+        "like images, videos, documents, and other media files. "
+        "Assets can be organized in directories and collections, "
+        "tagged with keywords, and enriched with metadata."
+    ),
 )
-async def search_files(params: SearchFilesInput) -> str:
-    """
-    Search for files in pixx.io Digital Asset Management.
-    
-    Searches across filenames, descriptions, and keywords.
-    Supports filtering by file type, pagination, and sorting.
-    
-    Args:
-        params: Search parameters including query, filters, sorting, and pagination
-        
-    Returns:
-        Formatted search results with file details
-        
-    Examples:
-        - Search for images: query="logo", file_types=["jpg", "png"]
-        - Find documents: query="report", file_types=["pdf", "docx"]
-        - Search by keyword: query="Neubau"
-    """
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _get_client() -> httpx.AsyncClient:
+    """Create an async HTTP client with pixx.io auth headers."""
+    if not PIXXIO_BASE_URL:
+        raise ValueError("PIXXIO_BASE_URL is not configured. Set the PIXXIO_BASE_URL environment variable.")
+    if not PIXXIO_API_KEY:
+        raise ValueError("PIXXIO_API_KEY is not configured. Set the PIXXIO_API_KEY environment variable.")
+    return httpx.AsyncClient(
+        base_url=PIXXIO_BASE_URL,
+        headers={"Authorization": f"Bearer {PIXXIO_API_KEY}"},
+        timeout=30.0,
+    )
+
+
+async def _api_get(path: str, params: Optional[dict] = None) -> dict:
+    """Make a GET request to the pixx.io API."""
+    async with _get_client() as client:
+        resp = await client.get(path, params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _api_post(path: str, data: Optional[dict] = None) -> dict:
+    """Make a POST request to the pixx.io API (multipart/form-data)."""
+    async with _get_client() as client:
+        resp = await client.post(path, data=data or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _api_put(path: str, data: Optional[dict] = None) -> dict:
+    """Make a PUT request to the pixx.io API (multipart/form-data)."""
+    async with _get_client() as client:
+        resp = await client.put(path, data=data or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _download_preview(preview_url: str, width: int = 400) -> Optional[Image]:
+    """Download a preview image and return it as a FastMCP Image."""
+    if not preview_url:
+        return None
     try:
-        api_key = _get_api_key(params.api_key)
-        client = PixxioAPIClient(api_key=api_key)
-        
-        # Build search filter using pixx.io's filter structure
-        search_filter = {
+        # Adjust width parameter in the preview URL
+        if "&width=" in preview_url:
+            preview_url = preview_url.rsplit("&width=", 1)[0] + f"&width={width}"
+        elif "?" in preview_url:
+            preview_url += f"&width={width}"
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers={"Authorization": f"Bearer {PIXXIO_API_KEY}"}) as client:
+            resp = await client.get(preview_url)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+            return Image(data=resp.content, media_type=content_type)
+    except Exception as e:
+        logger.warning(f"Failed to download preview: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 1: search  (Required for ChatGPT Deep Research)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def search(
+    query: str,
+    page: int = 1,
+    page_size: int = 20,
+    sort_by: str = "uploadDate",
+    sort_direction: str = "desc",
+    file_type: Optional[str] = None,
+    file_extension: Optional[str] = None,
+    directory_id: Optional[int] = None,
+    collection_id: Optional[int] = None,
+    include_previews: bool = True,
+) -> list:
+    """Search for assets in the pixx.io Digital Asset Management system.
+
+    Use this tool to find images, videos, documents and other media files.
+    The query searches across file names, descriptions, keywords, and metadata.
+
+    Args:
+        query: Search term to find assets (searches names, descriptions, keywords).
+        page: Page number for pagination (starts at 1).
+        page_size: Number of results per page (max 100).
+        sort_by: Sort field — one of: uploadDate, fileName, modifyDate, createDate, rating.
+        sort_direction: Sort order — "asc" or "desc".
+        file_type: Optional filter by type: "image", "video", "document", "audio".
+        file_extension: Optional filter by extension: "jpg", "png", "pdf", "mp4", etc.
+        directory_id: Optional filter by directory ID.
+        collection_id: Optional filter by collection ID.
+        include_previews: If True, include thumbnail images in the response (default: True).
+
+    Returns:
+        Asset search results with optional preview thumbnails.
+    """
+    params: dict = {
+        "showFiles": "true",
+        "page": page,
+        "pageSize": min(page_size, 100),
+        "sortBy": sort_by,
+        "sortDirection": sort_direction,
+        "responseFields": "id,fileName,fileExtension,fileType,previewFileURL,description,keywords,subject,rating,uploadDate,fileSize,width,height",
+    }
+
+    # Build filter
+    filters = []
+
+    if query:
+        filters.append({
             "filterType": "searchTerm",
-            "term": params.query,
-            "exactMatch": False,
+            "term": query,
             "useSynonyms": True,
-            "inverted": False
+        })
+
+    if file_type:
+        filters.append({
+            "filterType": "fileType",
+            "fileType": file_type,
+        })
+
+    if file_extension:
+        filters.append({
+            "filterType": "fileExtension",
+            "fileExtension": file_extension,
+        })
+
+    if directory_id:
+        filters.append({
+            "filterType": "directory",
+            "directoryID": directory_id,
+            "includeSubdirectories": True,
+        })
+
+    if collection_id:
+        filters.append({
+            "filterType": "collection",
+            "collectionID": collection_id,
+        })
+
+    if len(filters) == 1:
+        params["filter"] = json.dumps(filters[0])
+    elif len(filters) > 1:
+        params["filter"] = json.dumps({
+            "filterType": "connectorAnd",
+            "filters": filters,
+        })
+
+    data = await _api_get("/api/v1/files", params)
+
+    files = data.get("files", [])
+    quantity = data.get("quantity", 0)
+
+    # Build response compatible with ChatGPT Deep Research (ids + results)
+    results = []
+    ids = []
+    for f in files:
+        fid = str(f.get("id", ""))
+        ids.append(fid)
+        results.append({
+            "id": fid,
+            "title": f.get("fileName", ""),
+            "description": f.get("description", "") or f.get("subject", ""),
+            "file_type": f.get("fileType", ""),
+            "file_extension": f.get("fileExtension", ""),
+            "keywords": f.get("keywords", []),
+            "rating": f.get("rating"),
+            "preview_url": f.get("previewFileURL", ""),
+            "upload_date": f.get("uploadDate", ""),
+            "file_size": f.get("fileSize"),
+            "dimensions": f"{f.get('width', '?')}x{f.get('height', '?')}" if f.get("width") else None,
+        })
+
+    return_data = {
+        "ids": ids,
+        "results": results,
+        "total_results": quantity,
+        "page": page,
+        "page_size": page_size,
+    }
+
+    if not include_previews:
+        return return_data
+
+    # Return text data + preview images as inline content
+    response_items: list = [return_data]
+    for f in files:
+        preview_url = f.get("previewFileURL", "")
+        if preview_url:
+            img = await _download_preview(preview_url, width=300)
+            if img:
+                response_items.append(f"📷 {f.get('fileName', 'unknown')} (ID: {f.get('id')})")
+                response_items.append(img)
+
+    return response_items
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 2: fetch  (Required for ChatGPT Deep Research)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def fetch(id: str) -> list:
+    """Fetch complete details for a specific asset by its ID.
+
+    Returns all metadata, keywords, preview URLs, file information,
+    and displays the preview image inline.
+
+    Args:
+        id: The asset ID to retrieve (as returned by the search tool).
+
+    Returns:
+        Complete asset record with preview image.
+    """
+    data = await _api_get(f"/api/v1/files/{id}")
+
+    f = data.get("file", data)
+
+    result = {
+        "id": str(f.get("id", id)),
+        "title": f.get("fileName", ""),
+        "file_name": f.get("fileName", ""),
+        "file_extension": f.get("fileExtension", ""),
+        "file_type": f.get("fileType", ""),
+        "file_size": f.get("fileSize"),
+        "description": f.get("description", ""),
+        "subject": f.get("subject", ""),
+        "creator": f.get("creator", ""),
+        "keywords": f.get("keywords", []),
+        "rating": f.get("rating"),
+        "colorspace": f.get("colorspace", ""),
+        "width": f.get("width"),
+        "height": f.get("height"),
+        "orientation": f.get("orientation", ""),
+        "preview_url": f.get("previewFileURL", ""),
+        "original_file_url": f.get("originalFileURL", ""),
+        "create_date": f.get("createDate", ""),
+        "modify_date": f.get("modifyDate", ""),
+        "upload_date": f.get("uploadDate", ""),
+        "directory": f.get("directory"),
+        "collections": f.get("staticCollections", []),
+        "language_codes": f.get("languageCodes", []),
+        "is_archived": f.get("isArchived", False),
+        "is_download_locked": f.get("isDownloadLocked", False),
+        "metadata_fields": f.get("metadataFields"),
+    }
+
+    # Include preview image inline
+    response_items: list = [result]
+    preview_url = f.get("previewFileURL", "")
+    if preview_url:
+        img = await _download_preview(preview_url, width=800)
+        if img:
+            response_items.append(img)
+
+    return response_items
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 3: get_download_url
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_download_url(
+    id: int,
+    download_type: str = "original",
+    file_extension: Optional[str] = None,
+    max_size: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    quality: int = 90,
+) -> dict:
+    """Generate a download URL for a specific asset.
+
+    Supports downloading the original file or converting to different formats/sizes.
+
+    Args:
+        id: The asset ID.
+        download_type: "original" (unchanged), "preview" (web), or "custom" (converted).
+        file_extension: Target format for custom: "jpg", "png", "pdf", "tiff", "webp".
+        max_size: Resize longest side to this pixel value (keeps aspect ratio).
+        width: Target width in pixels.
+        height: Target height in pixels.
+        quality: JPEG quality 1-100 (default 90).
+
+    Returns:
+        Dictionary with download URL.
+    """
+    params: dict = {
+        "downloadType": download_type,
+        "responseType": "path",
+        "quality": quality,
+    }
+    if file_extension and download_type == "custom":
+        params["fileExtension"] = file_extension
+    if max_size:
+        params["maxSize"] = max_size
+    if width:
+        params["width"] = width
+    if height:
+        params["height"] = height
+
+    data = await _api_get(f"/api/v1/files/{id}/convert", params)
+
+    return {
+        "id": str(id),
+        "download_url": data.get("downloadURL", data.get("path", "")),
+        "download_type": download_type,
+        "file_extension": file_extension or "original",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 3b: get_preview
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_preview(
+    id: str,
+    width: int = 800,
+) -> list:
+    """Get the preview image of an asset displayed inline.
+
+    Use this to view an asset's image directly. For downloading the
+    original file, use get_download_url instead.
+
+    Args:
+        id: The asset ID.
+        width: Preview width in pixels (default: 800).
+
+    Returns:
+        The preview image displayed inline.
+    """
+    data = await _api_get(f"/api/v1/files/{id}")
+    f = data.get("file", data)
+    preview_url = f.get("previewFileURL", "")
+
+    if not preview_url:
+        return [f"No preview available for asset {id}."]
+
+    img = await _download_preview(preview_url, width=width)
+    if not img:
+        return [f"Failed to load preview for asset {id}."]
+
+    return [
+        f"Preview of {f.get('fileName', 'unknown')} ({f.get('width', '?')}x{f.get('height', '?')} px)",
+        img,
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 4: list_directories
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def list_directories(
+    parent_id: Optional[int] = None,
+    show_tree: bool = False,
+) -> dict:
+    """List directories (folders) in the pixx.io DAM.
+
+    Browse the folder structure or find a specific directory
+    before searching for files within it.
+
+    Args:
+        parent_id: ID of the parent directory. Omit for root level.
+        show_tree: If True, returns the full directory tree.
+
+    Returns:
+        List of directories with IDs, names, paths, and file counts.
+    """
+    if show_tree:
+        data = await _api_get("/api/v1/directories/tree")
+    else:
+        params: dict = {}
+        if parent_id:
+            params["parentID"] = parent_id
+        data = await _api_get("/api/v1/directories", params)
+
+    dirs = data.get("directories", data.get("tree", []))
+
+    def _format_dir(d: dict) -> dict:
+        result = {
+            "id": d.get("id"),
+            "name": d.get("name", ""),
+            "path": d.get("path", ""),
+            "has_children": d.get("hasChildren", False),
+            "file_count": d.get("quantity", 0),
         }
-        
-        # If file types specified, combine with file extension filter
-        if params.file_types:
-            filters = [search_filter]
-            for file_type in params.file_types:
-                filters.append({
-                    "filterType": "fileExtension",
-                    "fileExtension": file_type.lower(),
-                    "inverted": False
-                })
-            
-            # Wrap in connector if multiple filters
-            if len(filters) > 1:
-                search_filter = {
-                    "filterType": "connectorAnd",
-                    "filters": filters,
-                    "inverted": False
-                }
-        
-        # Build request parameters
-        request_params = {
-            "page": params.page,
-            "pageSize": params.page_size,
-            "sortBy": params.sort_by.value,
-            "sortDirection": params.sort_direction.value,
-            "showFiles": True,
-            "responseFields": json.dumps([
-                "id", "fileName", "fileSize", "fileType", "uploadDate", 
-                "description", "keywords", "previewFileURL", "originalFileURL"
-            ])
-        }
-        
-        # Note: httpx will automatically JSON-encode dict values in params
-        # pixx.io expects the filter as a JSON string in the query parameter
-        request_params["filter"] = json.dumps(search_filter)
-        
-        response = await client.request(
-            method="GET",
-            endpoint="/v1/files",
-            params=request_params
-        )
-        
-        files = response.get("files", [])
-        total = response.get("totalNumberOfFiles", 0)
-        
-        if params.response_format == ResponseFormat.JSON:
-            result = {
-                "total": total,
-                "count": len(files),
-                "page": params.page,
-                "page_size": params.page_size,
-                "files": files
+        if d.get("children"):
+            result["children"] = [_format_dir(c) for c in d["children"]]
+        return result
+
+    return {
+        "directories": [_format_dir(d) for d in dirs] if isinstance(dirs, list) else dirs,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 5: list_collections
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def list_collections(
+    page: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """List all collections in the pixx.io DAM.
+
+    Collections are curated groups of assets (like albums or lightboxes).
+
+    Args:
+        page: Page number (starts at 1).
+        page_size: Results per page (max 100).
+
+    Returns:
+        List of collections with IDs, names, descriptions, and file counts.
+    """
+    params = {
+        "page": page,
+        "pageSize": min(page_size, 100),
+    }
+    data = await _api_get("/api/v1/collections", params)
+
+    collections = data.get("collections", [])
+
+    return {
+        "collections": [
+            {
+                "id": c.get("id"),
+                "name": c.get("name", ""),
+                "description": c.get("description", ""),
+                "is_dynamic": c.get("isDynamic", False),
+                "file_count": c.get("filesQuantity", 0),
+                "create_date": c.get("createDate", ""),
             }
-            return json.dumps(result, indent=2)
-        
-        # Markdown format
-        lines = [
-            f"# Search Results: \"{params.query}\"",
-            f"\nFound {total} files (showing {len(files)} on page {params.page})\n"
-        ]
-        
-        if not files:
-            lines.append("No files found matching your search criteria.")
-        else:
-            for file in files:
-                lines.append(_format_asset_markdown(file))
-                lines.append("\n---\n")
-        
-        return "\n".join(lines)
-    
-    except Exception as e:
-        return f"Error searching files: {str(e)}"
-
-@mcp.tool(
-    name="pixxio_get_file_details",
-    annotations={
-        "title": "Get File Details",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
+            for c in collections
+        ],
+        "total": data.get("quantity", len(collections)),
     }
-)
-async def get_file_details(params: GetFileDetailsInput) -> str:
-    """
-    Get detailed information about a specific file.
-    
-    Retrieves complete metadata, file information, and download links.
-    
-    Args:
-        params: File ID and response format
-        
-    Returns:
-        Detailed file information including metadata and download options
-    """
-    try:
-        api_key = _get_api_key(params.api_key)
-        client = PixxioAPIClient(api_key=api_key)
-        
-        response = await client.request(
-            method="GET",
-            endpoint=f"/v1/files/{params.file_id}"
-        )
-        
-        file = response.get("file", {})
-        
-        if params.response_format == ResponseFormat.JSON:
-            return json.dumps(file, indent=2)
-        
-        return _format_asset_markdown(file)
-    
-    except Exception as e:
-        return f"Error getting file details: {str(e)}"
 
-@mcp.tool(
-    name="pixxio_download_file",
-    annotations={
-        "title": "Download File from pixx.io",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 6: get_keywords
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_keywords(
+    query: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict:
+    """List keywords (tags) used across assets in the DAM.
+
+    Args:
+        query: Optional search term to filter keywords.
+        page: Page number.
+        page_size: Results per page.
+
+    Returns:
+        List of keywords with usage counts.
+    """
+    params: dict = {
+        "page": page,
+        "pageSize": min(page_size, 100),
     }
-)
-async def download_file(params: DownloadFileInput) -> str:
-    """
-    Download a file from pixx.io in various formats.
-    
-    Downloads files for display in chat or for use in other tools (e.g., PowerPoint creation).
-    Supports multiple download types:
-    - preview: Optimized preview version (default, best for chat display)
-    - original: Original file without any conversion
-    - custom: Convert with custom settings (width, height, quality, format)
-    - downloadFormat: Use a predefined download format
-    
-    The downloaded file is saved to a temporary location and made available for use.
-    
+    if query:
+        params["filter"] = query
+
+    data = await _api_get("/api/v1/keywords", params)
+
+    return {
+        "keywords": data.get("keywords", []),
+        "total": data.get("quantity", 0),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 7: update_asset
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def update_asset(
+    ids: list[int],
+    description: Optional[str] = None,
+    subject: Optional[str] = None,
+    rating: Optional[int] = None,
+    keywords_to_add: Optional[list[str]] = None,
+    keywords_to_remove: Optional[list[str]] = None,
+    directory_id: Optional[int] = None,
+) -> dict:
+    """Update metadata for one or more assets.
+
     Args:
-        params: Download parameters including file ID, type, and conversion settings
-        
+        ids: List of asset IDs to update.
+        description: New description text.
+        subject: New subject/title text.
+        rating: Rating value (0-5).
+        keywords_to_add: Keywords to add.
+        keywords_to_remove: Keywords to remove.
+        directory_id: Move asset(s) to this directory.
+
     Returns:
-        Success message with file information. File is ready for use in other tools.
-        
-    Examples:
-        - Download preview for chat: file_id=123, download_type="preview"
-        - Download original: file_id=123, download_type="original"
-        - Download resized JPG: file_id=123, download_type="custom", width=800, quality=85
-        - For PowerPoint: file_id=123, download_type="preview", show_in_chat=False
+        Confirmation of the update.
     """
-    try:
-        api_key = _get_api_key(params.api_key)
-        client = PixxioAPIClient(api_key=api_key)
-        
-        # Build query parameters based on download type
-        query_params = {
-            "downloadType": params.download_type.value,
-            "responseType": "binary"  # Always download as binary
-        }
-        
-        # Add custom conversion parameters if applicable
-        if params.download_type == DownloadType.CUSTOM:
-            if params.width:
-                query_params["width"] = params.width
-            if params.height:
-                query_params["height"] = params.height
-            if params.quality:
-                query_params["quality"] = params.quality
-            if params.file_extension:
-                query_params["fileExtension"] = params.file_extension
-        
-        # Add download format ID if specified
-        if params.download_type == DownloadType.DOWNLOAD_FORMAT:
-            if not params.download_format_id:
-                return "Error: download_format_id is required when download_type is 'downloadFormat'"
-            query_params["downloadFormatID"] = params.download_format_id
-        
-        # Download the file
-        async with httpx.AsyncClient(timeout=60.0) as http_client:
-            url = f"{client.base_url}/v1/files/{params.file_id}/convert"
-            
-            headers = client.base_headers.copy()
-            
-            response = await http_client.get(
-                url=url,
-                headers=headers,
-                params=query_params
-            )
-            
-            # Check for HTTP errors
-            if response.status_code != 200:
-                try:
-                    error_data = response.json()
-                    return f"Error downloading file: HTTP {response.status_code} - {error_data.get('errorMessage', error_data)}"
-                except:
-                    return f"Error downloading file: HTTP {response.status_code} - {response.text[:500]}"
-            
-            # Get filename from Content-Disposition header
-            content_disposition = response.headers.get('Content-Disposition', '')
-            filename = params.save_path
-            
-            if not filename:
-                # Extract filename from header
-                if 'filename=' in content_disposition:
-                    # Parse filename from Content-Disposition
-                    parts = content_disposition.split('filename=')
-                    if len(parts) > 1:
-                        filename = parts[1].split(';')[0].strip().strip('"').strip("'")
-                
-                if not filename:
-                    # Fallback to file_id with appropriate extension
-                    ext = params.file_extension if params.download_type == DownloadType.CUSTOM else "jpg"
-                    filename = f"pixxio_{params.file_id}.{ext}"
-            
-            # Ensure filename has extension
-            if '.' not in filename:
-                ext = params.file_extension if params.download_type == DownloadType.CUSTOM else "jpg"
-                filename = f"{filename}.{ext}"
-            
-            # Use temp directory as working directory
-            import tempfile
-            import os
-            work_dir = tempfile.gettempdir()
-            work_path = os.path.join(work_dir, filename)
-            
-            # Save file
-            with open(work_path, 'wb') as f:
-                f.write(response.content)
-            
-            # Note: File will be automatically cleaned up by the system
-            # The file path can be used by other tools (e.g., PowerPoint creation)
-            
-            result = f"""✅ File downloaded successfully!
+    form_data: dict = {
+        "ids": json.dumps(ids),
+    }
+    if description is not None:
+        form_data["description"] = description
+    if subject is not None:
+        form_data["subject"] = subject
+    if rating is not None:
+        form_data["rating"] = str(rating)
+    if keywords_to_add:
+        form_data["keywordsToAdd"] = json.dumps(keywords_to_add)
+    if keywords_to_remove:
+        form_data["keywordsToRemove"] = json.dumps(keywords_to_remove)
+    if directory_id:
+        form_data["directoryID"] = str(directory_id)
 
-**File ID**: {params.file_id}
-**Download Type**: {params.download_type.value}
-**Filename**: {filename}
-**Size**: {_format_filesize(len(response.content))}
-**Temporary Path**: {work_path}
+    data = await _api_put("/api/v1/files", form_data)
 
-💡 This file is now available for use in other tools (e.g., creating presentations, editing, etc.)"""
-            
-            return result
-    
-    except httpx.HTTPStatusError as e:
-        return f"Error downloading file: HTTP {e.response.status_code} - {e.response.text[:200]}"
-    except Exception as e:
-        return f"Error downloading file: {str(e)}"
+    return {
+        "success": data.get("success", False),
+        "updated_ids": ids,
+        "message": f"Successfully updated {len(ids)} asset(s).",
+    }
 
-# ============================================================================
-# MAIN - For local development and testing
-# ============================================================================
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 8: get_metadata_fields
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_metadata_fields() -> dict:
+    """List all available metadata fields configured in the DAM.
+
+    Returns:
+        Dictionary of metadata field definitions.
+    """
+    fields = await _api_get("/api/v1/metadataFields")
+    return {"metadata_fields": fields.get("metadataFields", fields)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 9: get_download_formats
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_download_formats() -> dict:
+    """List configured download formats (conversion presets).
+
+    Download formats are pre-configured conversion settings like
+    "Web JPG 1200px" or "Print TIFF CMYK".
+
+    Returns:
+        List of download formats with their settings.
+    """
+    data = await _api_get("/api/v1/downloadFormats")
+    return {"download_formats": data.get("downloadFormats", [])}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 10: create_collection
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def create_collection(
+    name: str,
+    description: str = "",
+    file_ids: Optional[list[int]] = None,
+) -> dict:
+    """Create a new static collection (album/lightbox) in the DAM.
+
+    Args:
+        name: Name of the new collection.
+        description: Optional description.
+        file_ids: Optional list of asset IDs to include.
+
+    Returns:
+        The ID of the newly created collection.
+    """
+    form_data: dict = {"name": name, "description": description}
+    if file_ids:
+        form_data["fileIDs"] = json.dumps(file_ids)
+
+    data = await _api_post("/api/v1/collections", form_data)
+
+    return {
+        "success": data.get("success", False),
+        "collection_id": data.get("id"),
+        "name": name,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 11: create_external_share
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def create_external_share(
+    name: str,
+    file_ids: list[int],
+    allow_download: bool = True,
+    recipients: Optional[list[dict]] = None,
+) -> dict:
+    """Create an external share link for assets.
+
+    Allows people outside the organization to view/download assets via a link.
+
+    Args:
+        name: Name/title for the share.
+        file_ids: List of asset IDs to share.
+        allow_download: Whether recipients can download files.
+        recipients: Optional list of recipients [{"email": "...", "language": "en"}].
+
+    Returns:
+        Share details including the share URL.
+    """
+    form_data: dict = {
+        "name": name,
+        "fileIDs": json.dumps(file_ids),
+        "allowDownload": json.dumps(allow_download),
+    }
+    if recipients:
+        form_data["recipients"] = json.dumps(recipients)
+
+    data = await _api_post("/api/v1/externalShares", form_data)
+
+    return {
+        "success": data.get("success", False),
+        "share_id": data.get("id"),
+        "share_url": data.get("url", ""),
+        "name": name,
+        "file_count": len(file_ids),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Health check endpoint
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Health check endpoint for deployment monitoring."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({
+        "status": "ok",
+        "server": "pixx.io MCP Server",
+        "transport": TRANSPORT,
+        "pixxio_configured": bool(PIXXIO_BASE_URL and PIXXIO_API_KEY),
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # This block is used for local development
-    # It will be ignored by FastMCP Cloud
-    mcp.run()
+    logger.info(f"Starting pixx.io MCP Server (transport={TRANSPORT})")
+    logger.info(f"pixx.io instance: {PIXXIO_BASE_URL or 'NOT CONFIGURED'}")
+    logger.info(f"API key: {'configured' if PIXXIO_API_KEY else 'NOT CONFIGURED'}")
+
+    if TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        logger.info(f"HTTP server on {HOST}:{PORT}")
+        logger.info(f"MCP endpoint: http://{HOST}:{PORT}/mcp")
+        logger.info(f"Health check: http://{HOST}:{PORT}/health")
+        mcp.run(transport="http", host=HOST, port=PORT, stateless_http=True)
