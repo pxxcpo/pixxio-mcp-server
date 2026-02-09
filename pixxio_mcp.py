@@ -382,7 +382,9 @@ async def get_preview(
         resp = await client.get(preview_url)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-        return Image(data=resp.content, media_type=content_type)
+        # Extract format from content-type (e.g. "image/jpeg" -> "jpeg")
+        fmt = content_type.split("/")[-1] if "/" in content_type else "jpeg"
+        return Image(data=resp.content, format=fmt)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
