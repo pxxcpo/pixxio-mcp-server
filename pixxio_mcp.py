@@ -22,7 +22,7 @@ from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
-from mcp.server.fastmcp.utilities.types import Image
+from mcp.types import ImageContent
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -350,7 +350,7 @@ async def get_download_url(
 async def get_preview(
     id: str,
     width: int = 800,
-) -> Image:
+) -> ImageContent:
     """Get the preview image of an asset displayed inline.
 
     Use this to view an asset's image directly in the chat.
@@ -363,6 +363,8 @@ async def get_preview(
     Returns:
         The preview image displayed inline.
     """
+    import base64
+
     data = await _api_get(f"/api/v1/files/{id}", {
         "responseFields": "id,fileName,previewFileURL,width,height",
     })
@@ -382,9 +384,8 @@ async def get_preview(
         resp = await client.get(preview_url)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-        # Extract format from content-type (e.g. "image/jpeg" -> "jpeg")
-        fmt = content_type.split("/")[-1] if "/" in content_type else "jpeg"
-        return Image(data=resp.content, format=fmt)
+        b64_data = base64.b64encode(resp.content).decode("utf-8")
+        return ImageContent(type="image", data=b64_data, mimeType=content_type)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
