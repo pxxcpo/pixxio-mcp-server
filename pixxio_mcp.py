@@ -22,7 +22,18 @@ from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
-from mcp.types import ImageContent
+
+# Image import — location varies by fastmcp version
+try:
+    from fastmcp import Image
+except ImportError:
+    try:
+        from fastmcp.utilities.types import Image
+    except ImportError:
+        try:
+            from fastmcp.server.types import Image
+        except ImportError:
+            Image = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -287,7 +298,7 @@ async def fetch(id: str) -> dict:
 
 @mcp.tool(annotations={"readOnlyHint": True})
 async def get_download_url(
-    id: int,
+    id: str,
     download_type: str = "original",
     file_extension: Optional[str] = None,
     max_size: Optional[int] = None,
@@ -333,7 +344,7 @@ async def get_download_url(
 
     return {
         "id": str(id),
-        "download_url": data.get("downloadURL", data.get("path", "")),
+        "download_url": data.get("downloadURL") or data.get("downloadUrl") or data.get("path", ""),
         "file_name": data.get("fileName", ""),
         "file_extension": data.get("fileExtension", file_extension or "original"),
         "file_size": data.get("fileSize"),
@@ -350,7 +361,7 @@ async def get_download_url(
 async def get_preview(
     id: str,
     width: int = 800,
-) -> ImageContent:
+):
     """Get the preview image of an asset displayed inline.
 
     Use this to view an asset's image directly in the chat.
@@ -363,29 +374,29 @@ async def get_preview(
     Returns:
         The preview image displayed inline.
     """
-    import base64
-
-    data = await _api_get(f"/api/v1/files/{id}", {
-        "responseFields": "id,fileName,previewFileURL,width,height",
+    # Use the convert API — returns a full public URL
+    data = await _api_get(f"/api/v1/files/{id}/convert", {
+        "downloadType": "preview",
+        "responseType": "path",
+        "maxSize": width,
     })
-    f = data.get("file", data)
-    preview_url = f.get("previewFileURL", "")
+    # pixx.io API may return "downloadURL" or "downloadUrl"
+    download_url = data.get("downloadURL") or data.get("downloadUrl") or ""
 
-    if not preview_url:
+    if not download_url:
         raise ValueError(f"No preview available for asset {id}.")
 
-    # Adjust width parameter in the preview URL
-    if "&width=" in preview_url:
-        preview_url = preview_url.rsplit("&width=", 1)[0] + f"&width={width}"
-    elif "?" in preview_url:
-        preview_url += f"&width={width}"
+    logger.info(f"get_preview: returning URL-based image: {download_url[:100]}...")
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers={"Authorization": f"Bearer {PIXXIO_API_KEY}"}) as client:
-        resp = await client.get(preview_url)
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-        b64_data = base64.b64encode(resp.content).decode("utf-8")
-        return ImageContent(type="image", data=b64_data, mimeType=content_type)
+    # Use fastmcp.Image if available, otherwise return URL as structured data
+    if Image is not None:
+        return Image(url=download_url)
+    else:
+        return {
+            "type": "image",
+            "url": download_url,
+            "note": "Open this URL to view the image.",
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -394,7 +405,7 @@ async def get_preview(
 
 @mcp.tool(annotations={"readOnlyHint": True})
 async def download_asset(
-    id: int,
+    id: str,
     download_type: str = "preview",
     file_extension: Optional[str] = None,
     max_size: Optional[int] = None,
@@ -442,7 +453,7 @@ async def download_asset(
         params["height"] = height
 
     data = await _api_get(f"/api/v1/files/{id}/convert", params)
-    download_url = data.get("downloadURL", "")
+    download_url = data.get("downloadURL") or data.get("downloadUrl") or ""
     file_name = data.get("fileName", f"asset_{id}")
     ext = data.get("fileExtension", "jpg")
 
