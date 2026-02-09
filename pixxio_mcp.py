@@ -52,7 +52,13 @@ mcp = FastMCP(
         "Use these tools to search, browse, and manage digital assets "
         "like images, videos, documents, and other media files. "
         "Assets can be organized in directories and collections, "
-        "tagged with keywords, and enriched with metadata."
+        "tagged with keywords, and enriched with metadata.\n\n"
+        "IMAGE HANDLING STRATEGY:\n"
+        "- To SHOW an image inline in the chat: use get_preview(id)\n"
+        "- To get a PUBLIC URL for embedding/sharing: use get_download_url(id)\n"
+        "- To DOWNLOAD a file for processing (presentations, documents): use download_asset(id)\n"
+        "When a user asks to see images, use get_preview. "
+        "When building documents or presentations, use download_asset to get local file paths."
     ),
 )
 
@@ -287,13 +293,17 @@ async def get_download_url(
     height: Optional[int] = None,
     quality: int = 90,
 ) -> dict:
-    """Generate a download URL for a specific asset.
+    """Generate a publicly accessible download URL for a specific asset.
+
+    The returned URL requires NO authentication and can be used directly by
+    AI agents, embedded in documents, presentations, or shared externally.
+    URLs are temporary and generated on demand.
 
     Supports downloading the original file or converting to different formats/sizes.
 
     Args:
         id: The asset ID.
-        download_type: "original" (unchanged), "preview" (web), or "custom" (converted).
+        download_type: "original" (unchanged), "preview" (web-optimized), or "custom" (converted).
         file_extension: Target format for custom: "jpg", "png", "pdf", "tiff", "webp".
         max_size: Resize longest side to this pixel value (keeps aspect ratio).
         width: Target width in pixels.
@@ -301,7 +311,7 @@ async def get_download_url(
         quality: JPEG quality 1-100 (default 90).
 
     Returns:
-        Dictionary with download URL.
+        Dictionary with publicly accessible download URL, file name, and file size.
     """
     params: dict = {
         "downloadType": download_type,
@@ -322,8 +332,11 @@ async def get_download_url(
     return {
         "id": str(id),
         "download_url": data.get("downloadURL", data.get("path", "")),
+        "file_name": data.get("fileName", ""),
+        "file_extension": data.get("fileExtension", file_extension or "original"),
+        "file_size": data.get("fileSize"),
         "download_type": download_type,
-        "file_extension": file_extension or "original",
+        "note": "This URL is publicly accessible without authentication.",
     }
 
 
@@ -366,6 +379,88 @@ async def get_preview(
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
         return Image(data=resp.content, media_type=content_type)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL 3c: download_asset
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def download_asset(
+    id: int,
+    download_type: str = "preview",
+    file_extension: Optional[str] = None,
+    max_size: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    quality: int = 90,
+) -> dict:
+    """Download an asset file to a temporary location for further processing.
+
+    Use this tool when you need the actual file for tasks like:
+    - Creating presentations (PPTX) with images
+    - Building documents (DOCX, PDF) with embedded images
+    - Image analysis or manipulation
+    - Any workflow that requires a local file path
+
+    The file is downloaded to a temporary directory and the path is returned.
+
+    Args:
+        id: The asset ID.
+        download_type: "original" (unchanged), "preview" (web-optimized), or "custom" (converted).
+        file_extension: Target format for custom: "jpg", "png", "pdf", "tiff", "webp".
+        max_size: Resize longest side to this pixel value (keeps aspect ratio).
+        width: Target width in pixels.
+        height: Target height in pixels.
+        quality: JPEG quality 1-100 (default 90).
+
+    Returns:
+        Dictionary with local file path, file name, size, and download URL.
+    """
+    import tempfile
+
+    # First get the download URL
+    params: dict = {
+        "downloadType": download_type,
+        "responseType": "path",
+        "quality": quality,
+    }
+    if file_extension and download_type == "custom":
+        params["fileExtension"] = file_extension
+    if max_size:
+        params["maxSize"] = max_size
+    if width:
+        params["width"] = width
+    if height:
+        params["height"] = height
+
+    data = await _api_get(f"/api/v1/files/{id}/convert", params)
+    download_url = data.get("downloadURL", "")
+    file_name = data.get("fileName", f"asset_{id}")
+    ext = data.get("fileExtension", "jpg")
+
+    if not download_url:
+        raise ValueError(f"Could not generate download URL for asset {id}.")
+
+    # Download the file
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        resp = await client.get(download_url)
+        resp.raise_for_status()
+
+        # Save to temp directory
+        tmp_dir = tempfile.mkdtemp(prefix="pixxio_")
+        file_path = os.path.join(tmp_dir, f"{file_name}.{ext}")
+        with open(file_path, "wb") as f:
+            f.write(resp.content)
+
+    return {
+        "id": str(id),
+        "file_path": file_path,
+        "file_name": f"{file_name}.{ext}",
+        "file_size": len(resp.content),
+        "download_url": download_url,
+        "note": "File downloaded to temporary location. Use file_path for further processing.",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
