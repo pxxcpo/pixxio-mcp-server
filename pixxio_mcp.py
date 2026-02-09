@@ -245,7 +245,9 @@ async def fetch(id: str) -> dict:
     Returns:
         Complete asset record with all available metadata.
     """
-    data = await _api_get(f"/api/v1/files/{id}")
+    data = await _api_get(f"/api/v1/files/{id}", {
+        "responseFields": "id,fileName,fileExtension,fileType,previewFileURL,originalFileURL,description,keywords,subject,rating,uploadDate,createDate,modifyDate,fileSize,width,height,colorspace,orientation,directory,staticCollections,languageCodes,isArchived,isDownloadLocked,metadataFields,creator",
+    })
 
     f = data.get("file", data)
 
@@ -361,7 +363,9 @@ async def get_preview(
     Returns:
         The preview image displayed inline.
     """
-    data = await _api_get(f"/api/v1/files/{id}")
+    data = await _api_get(f"/api/v1/files/{id}", {
+        "responseFields": "id,fileName,previewFileURL,width,height",
+    })
     f = data.get("file", data)
     preview_url = f.get("previewFileURL", "")
 
