@@ -22,41 +22,11 @@ from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 
 # ---------------------------------------------------------------------------
-# Image import — location & signature varies by fastmcp version
+# Logging
 # ---------------------------------------------------------------------------
-import inspect as _inspect
-import fastmcp as _fastmcp
-
-_Image = None
-_Image_source = "none"
-_Image_sig = "N/A"
-
-for _label, _import_fn in [
-    ("fastmcp", lambda: __import__("fastmcp", fromlist=["Image"]).Image),
-    ("fastmcp.utilities.types", lambda: __import__("fastmcp.utilities.types", fromlist=["Image"]).Image),
-    ("fastmcp.server.types", lambda: __import__("fastmcp.server.types", fromlist=["Image"]).Image),
-]:
-    try:
-        _Image = _import_fn()
-        _Image_source = _label
-        try:
-            _Image_sig = str(_inspect.signature(_Image.__init__))
-        except (ValueError, TypeError):
-            _Image_sig = str(_inspect.signature(_Image))
-        break
-    except (ImportError, AttributeError):
-        continue
-
-Image = _Image  # type: ignore
-
-# Log at module load so it always appears in Render logs
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-_boot_logger = logging.getLogger("pixxio-mcp-boot")
-_boot_logger.info(f"FASTMCP VERSION: {getattr(_fastmcp, '__version__', 'unknown')}")
-_boot_logger.info(f"IMAGE CLASS: {_Image} (from {_Image_source})")
-_boot_logger.info(f"IMAGE INIT SIG: {_Image_sig}")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -395,22 +365,8 @@ async def get_preview(
         width: Preview width in pixels (default: 800).
 
     Returns:
-        The preview image displayed inline.
+        The preview image displayed inline, plus a fallback URL.
     """
-    import base64
-    import inspect
-
-    # --- Debug logging (appears in Render logs on every call) ---
-    import fastmcp as _fm
-    logger.info(f"get_preview DEBUG: fastmcp={getattr(_fm, '__version__', 'unknown')}, "
-                f"Image={Image}, source={_Image_source}")
-    if Image is not None:
-        try:
-            sig = str(inspect.signature(Image.__init__))
-        except (ValueError, TypeError):
-            sig = str(inspect.signature(Image))
-        logger.info(f"get_preview DEBUG: Image.__init__ sig: {sig}")
-
     # --- Get preview URL from pixx.io convert API ---
     data = await _api_get(f"/api/v1/files/{id}/convert", {
         "downloadType": "preview",
@@ -422,51 +378,35 @@ async def get_preview(
     if not download_url:
         raise ValueError(f"No preview available for asset {id}.")
 
-    logger.info(f"get_preview: preview URL: {download_url[:120]}...")
+    logger.info(f"get_preview: URL={download_url[:120]}")
 
-    # --- Try returning Image in order of preference ---
-    if Image is not None:
-        # 1) Try Image(url=...)  — fastmcp 2.3+
-        try:
-            img = Image(url=download_url)
-            logger.info("get_preview: OK via Image(url=...)")
-            return img
-        except TypeError:
-            pass
+    # Text fallback — always visible, even if Image isn't rendered
+    fallback_text = f"Preview for asset {id}: {download_url}"
 
-        # 2) Try Image(data=bytes, media_type=...) — download first
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                resp = await client.get(download_url)
-                resp.raise_for_status()
-                img_bytes = resp.content
-                content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+    # --- Download image bytes and build Image ---
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(download_url)
+            resp.raise_for_status()
+            img_bytes = resp.content
 
-            logger.info(f"get_preview: downloaded {len(img_bytes)} bytes, trying Image(data=...)")
+        if len(img_bytes) == 0:
+            raise ValueError("Empty image response")
 
-            # Try common constructor signatures
-            for kwargs in [
-                {"data": img_bytes, "media_type": content_type},
-                {"data": img_bytes, "mime_type": content_type},
-                {"data": img_bytes, "format": content_type},
-                {"data": base64.b64encode(img_bytes).decode(), "media_type": content_type},
-            ]:
-                try:
-                    img = Image(**kwargs)
-                    logger.info(f"get_preview: OK via Image({list(kwargs.keys())})")
-                    return img
-                except TypeError:
-                    continue
-        except Exception as e:
-            logger.warning(f"get_preview: Image(data=...) failed: {e}")
+        # Determine format from Content-Type header
+        content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        fmt = "png" if "png" in content_type else "jpeg"
 
-    # 3) Fallback: return URL as structured text
-    logger.info("get_preview: fallback — returning URL as dict")
-    return {
-        "preview_url": download_url,
-        "asset_id": id,
-        "note": "Image could not be rendered inline. Open the preview_url to view.",
-    }
+        img = Image(data=img_bytes, format=fmt)
+        logger.info(f"get_preview: OK — {len(img_bytes)} bytes, format={fmt}")
+
+        # Return list: Image + text. Clients that render images show the image;
+        # clients that don't will at least show the URL text.
+        return [img, fallback_text]
+
+    except Exception as e:
+        logger.warning(f"get_preview: image download failed: {e}, returning URL only")
+        return fallback_text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
